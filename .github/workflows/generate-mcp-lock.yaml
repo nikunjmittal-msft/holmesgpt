@@ -33,6 +33,8 @@ jobs:
       - name: Check dependency scope
         run: |
           python - <<'PY'
+          import collections
+          import json
           import pathlib
           import subprocess
           import tomllib
@@ -49,6 +51,10 @@ jobs:
               (p["name"], p["version"])
               for p in after["package"] if p["name"] != "mcp"
           )
+          print(json.dumps({
+              "removed": list((collections.Counter(old_versions) - collections.Counter(new_versions)).elements()),
+              "added": list((collections.Counter(new_versions) - collections.Counter(old_versions)).elements()),
+          }, indent=2))
           assert old_versions == new_versions, "Unexpected non-MCP version changes"
           assert [p["version"] for p in after["package"] if p["name"] == "mcp"] == ["1.30.0"]
           assert after["metadata"]["lock-version"] == "2.0"
@@ -58,6 +64,7 @@ jobs:
           git diff --stat
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: mcp-1.30.0-poetry-lock
           path: poetry.lock
