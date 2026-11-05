@@ -1,0 +1,65 @@
+name: Generate MCP 1.30.0 lockfile
+
+on:
+  push:
+    branches:
+      - automation/generate-mcp-130-lock
+
+permissions:
+  contents: read
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry 1.8.5
+        run: python -m pip install "poetry==1.8.5" "cleo==2.1.0"
+
+      - name: Regenerate and validate lockfile
+        run: |
+          poetry --version
+          poetry lock --no-update --no-interaction
+          poetry check --lock
+
+      - name: Check dependency scope
+        run: |
+          python - <<'PY'
+          import pathlib
+          import subprocess
+          import tomllib
+
+          before = tomllib.loads(subprocess.check_output(
+              ["git", "show", "HEAD:poetry.lock"], text=True
+          ))
+          after = tomllib.loads(pathlib.Path("poetry.lock").read_text())
+          old_versions = sorted(
+              (p["name"], p["version"])
+              for p in before["package"] if p["name"] != "mcp"
+          )
+          new_versions = sorted(
+              (p["name"], p["version"])
+              for p in after["package"] if p["name"] != "mcp"
+          )
+          assert old_versions == new_versions, "Unexpected non-MCP version changes"
+          assert [p["version"] for p in after["package"] if p["name"] == "mcp"] == ["1.30.0"]
+          assert after["metadata"]["lock-version"] == "2.0"
+          print("MCP is locked to 1.30.0; other package versions are unchanged.")
+          PY
+          git diff --check
+          git diff --stat
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-1.30.0-poetry-lock
+          path: poetry.lock
+          if-no-files-found: error
+          retention-days: 7
