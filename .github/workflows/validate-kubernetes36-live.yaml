@@ -1,0 +1,202 @@
+name: Validate Kubernetes SDK 36 against real API
+
+on:
+  push:
+    branches:
+      - automation/validate-kubernetes36-live
+
+permissions:
+  contents: read
+
+jobs:
+  real-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      SSL_VERIFY: "true"
+      POD_NAMESPACE: sdk36-smoke
+      HOSTNAME: holmes-sdk36-smoke
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install validated SDK and Holmes dependencies
+        run: |
+          python -m pip install "poetry==1.8.5" "cleo==2.1.0"
+          poetry lock --no-update --no-interaction
+          poetry check --lock
+          poetry install --no-root --no-interaction
+          poetry run python -m pip check
+      - name: Install checksum-verified kind
+        run: |
+          mkdir -p "$RUNNER_TEMP/kind-bin"
+          cd "$RUNNER_TEMP/kind-bin"
+          curl --fail --location --silent --show-error -O https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          curl --fail --location --silent --show-error -O https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum
+          sha256sum --check kind-linux-amd64.sha256sum
+          mv kind-linux-amd64 kind
+          chmod +x kind
+          echo "$RUNNER_TEMP/kind-bin" >> "$GITHUB_PATH"
+      - name: Create isolated Kubernetes 1.36 cluster
+        run: |
+          kind create cluster --name holmes-sdk36-ci --wait 120s \
+            --image kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+          kubectl create namespace sdk36-smoke
+          kubectl -n sdk36-smoke run holmes-sdk36-smoke \
+            --image=docker.io/library/busybox:1.37.0 \
+            --labels=app=holmes-sdk36-smoke --restart=Never \
+            --command -- /bin/sh -c 'printf "sdk36 live smoke\n"; sleep 600'
+          kubectl -n sdk36-smoke wait --for=condition=Ready \
+            pod/holmes-sdk36-smoke --timeout=180s
+          kubectl -n sdk36-smoke expose pod holmes-sdk36-smoke \
+            --port=80 --target-port=8080
+          kubectl -n sdk36-smoke create serviceaccount sdk-reader
+          kubectl -n sdk36-smoke create role sdk-reader \
+            --verb=get,list --resource=pods,pods/log,services
+          kubectl -n sdk36-smoke create rolebinding sdk-reader \
+            --role=sdk-reader --serviceaccount=sdk36-smoke:sdk-reader
+          kubectl apply -f - <<'YAML'
+          apiVersion: apiextensions.k8s.io/v1
+          kind: CustomResourceDefinition
+          metadata:
+            name: healthchecks.holmesgpt.dev
+          spec:
+            group: holmesgpt.dev
+            names:
+              plural: healthchecks
+              singular: healthcheck
+              kind: HealthCheck
+            scope: Namespaced
+            versions:
+              - name: v1alpha1
+                served: true
+                storage: true
+                subresources:
+                  status: {}
+                schema:
+                  openAPIV3Schema:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+          YAML
+          kubectl wait --for=condition=Established \
+            crd/healthchecks.holmesgpt.dev --timeout=60s
+      - name: Exercise actual synchronous, authentication and async APIs
+        run: |
+          poetry run python - <<'PY'
+          import asyncio
+          import importlib.metadata
+          import json
+          import pathlib
+          import subprocess
+          import tempfile
+          from urllib.parse import urlsplit
+
+          from kubernetes import client, config
+          from kubernetes.aio import client as aio_client
+          from kubernetes.aio import config as aio_config
+          from kubernetes.client.rest import ApiException
+
+          from holmes.core.self_logs import HolmesLogsRequest, get_holmes_logs
+          from holmes.plugins.toolsets.service_discovery import find_service_url
+          from holmes_operator.models import CheckPhase
+          from holmes_operator.utils import update_healthcheck_status
+
+          config.load_kube_config()
+          configuration = client.Configuration.get_default_copy()
+          namespace = "sdk36-smoke"
+          report = {"sdk": importlib.metadata.version("kubernetes")}
+          assert report["sdk"] == "36.0.3"
+          assert configuration.verify_ssl is True
+          with client.ApiClient(configuration) as api_client:
+              core = client.CoreV1Api(api_client)
+              report["server"] = client.VersionApi(api_client).get_code().git_version
+              discovered = find_service_url("app=holmes-sdk36-smoke")
+              assert discovered == (
+                  "http://holmes-sdk36-smoke.sdk36-smoke.svc.cluster.local:80"
+              ), discovered
+              report["sync_service_discovery"] = True
+              logs = get_holmes_logs(HolmesLogsRequest(), core_api_factory=lambda: core)
+              assert logs["error"] is None, logs
+              assert logs["pods"][0]["ready"] is True, logs
+              assert logs["logs"][0]["text"] == "sdk36 live smoke\n", logs
+              report["sync_pod_models_and_logs_mtls"] = True
+
+              objects = client.CustomObjectsApi(api_client)
+              objects.create_namespaced_custom_object(
+                  group="holmesgpt.dev", version="v1alpha1", namespace=namespace,
+                  plural="healthchecks",
+                  body={"apiVersion": "holmesgpt.dev/v1alpha1", "kind": "HealthCheck",
+                        "metadata": {"name": "sdk-check"}, "spec": {}},
+              )
+              asyncio.run(update_healthcheck_status(
+                  objects, "sdk-check", namespace, phase=CheckPhase.RUNNING
+              ))
+              updated = objects.get_namespaced_custom_object(
+                  group="holmesgpt.dev", version="v1alpha1", namespace=namespace,
+                  plural="healthchecks", name="sdk-check",
+              )
+              assert updated["status"]["phase"] == "Running", updated
+              report["sync_operator_status_patch"] = True
+
+          token = subprocess.check_output(
+              ["kubectl", "-n", namespace, "create", "token", "sdk-reader",
+               "--duration=10m"], text=True
+          ).strip()
+          endpoint = urlsplit(configuration.host)
+          with tempfile.TemporaryDirectory() as directory:
+              token_file = pathlib.Path(directory) / "token"
+              token_file.write_text(token)
+              loader = config.incluster_config.InClusterConfigLoader(
+                  token_filename=str(token_file),
+                  cert_filename=configuration.ssl_ca_cert,
+                  environ={"KUBERNETES_SERVICE_HOST": endpoint.hostname,
+                           "KUBERNETES_SERVICE_PORT": str(endpoint.port)},
+              )
+              sa_configuration = client.Configuration()
+              loader.load_and_set(sa_configuration)
+              with client.ApiClient(sa_configuration) as api_client:
+                  core = client.CoreV1Api(api_client)
+                  logs = get_holmes_logs(
+                      HolmesLogsRequest(), core_api_factory=lambda: core
+                  )
+                  assert logs["error"] is None, logs
+                  assert logs["logs"][0]["text"] == "sdk36 live smoke\n", logs
+                  report["incluster_loader_serviceaccount_token"] = True
+                  try:
+                      core.list_namespace()
+                  except ApiException as error:
+                      assert error.status == 403
+                  else:
+                      raise AssertionError("Reader unexpectedly has cluster-wide access")
+                  report["rbac_forbidden_preserved"] = True
+
+          async def native_aio():
+              configuration = aio_client.Configuration()
+              await aio_config.load_kube_config(client_configuration=configuration)
+              async with aio_client.ApiClient(configuration) as api_client:
+                  pods = await aio_client.CoreV1Api(api_client).list_namespaced_pod(
+                      namespace=namespace, label_selector="app=holmes-sdk36-smoke"
+                  )
+                  assert [pod.metadata.name for pod in pods.items] == [
+                      "holmes-sdk36-smoke"
+                  ]
+
+          asyncio.run(native_aio())
+          report["native_asyncio_kubeconfig_mtls"] = True
+          pathlib.Path("sdk36-live-results.json").write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kubernetes36-live-api
+          path: sdk36-live-results.json
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove isolated test cluster
+        if: always()
+        run: kind delete cluster --name holmes-sdk36-ci
