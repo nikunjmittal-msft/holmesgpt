@@ -1,6 +1,7 @@
 """Exercise Kubernetes SDK compatibility against an isolated HTTP API stub."""
 
 import json
+import ssl
 import sys
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,10 +17,11 @@ from holmes.core import self_logs
 from holmes.plugins.toolsets import service_discovery
 from holmes_operator.models import CheckPhase
 from holmes_operator.utils import update_healthcheck_status
+from tests.plugins.toolsets.test_prometheus_ssl import generate_self_signed_cert
 
 
 @pytest.fixture
-def api_server():
+def api_server(request, tmp_path):
     routes = {}
     requests = []
 
@@ -56,10 +58,19 @@ def api_server():
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    scheme = "http"
+    if getattr(request, "param", False):
+        cert_file = tmp_path / "ca.crt"
+        key_file = tmp_path / "server.key"
+        generate_self_signed_cert(str(cert_file), str(key_file))
+        ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.load_cert_chain(str(cert_file), str(key_file))
+        server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
     thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}", routes, requests
+        yield f"{scheme}://localhost:{server.server_port}", routes, requests
     finally:
         server.shutdown()
         server.server_close()
@@ -141,6 +152,7 @@ def test_kubeconfig_authentication_reaches_the_api(api_server, use_exec):
     assert requests[0]["headers"]["Authorization"] == "Bearer test-token"
 
 
+@pytest.mark.parametrize("api_server", [True], indirect=True)
 def test_incluster_authentication_refreshes_projected_token(
     api_server, monkeypatch, tmp_path
 ):
@@ -149,9 +161,9 @@ def test_incluster_authentication_refreshes_projected_token(
     token_file = tmp_path / "token"
     ca_file = tmp_path / "ca.crt"
     token_file.write_text("original-token")
-    ca_file.write_text("test-ca")
-    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "127.0.0.1")
-    monkeypatch.setenv("KUBERNETES_SERVICE_PORT", "443")
+    server_url = urlsplit(host)
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", server_url.hostname)
+    monkeypatch.setenv("KUBERNETES_SERVICE_PORT", str(server_url.port))
     monkeypatch.setattr(config.incluster_config, "SERVICE_TOKEN_FILENAME", str(token_file))
     monkeypatch.setattr(config.incluster_config, "SERVICE_CERT_FILENAME", str(ca_file))
     configuration = client.Configuration()
@@ -160,7 +172,6 @@ def test_incluster_authentication_refreshes_projected_token(
         config.load_incluster_config(client_configuration=configuration)
         assert configuration.ssl_ca_cert == str(ca_file)
         assert configuration.verify_ssl is True
-        configuration.host = host
         with client.ApiClient(configuration) as api_client:
             api = client.CoreV1Api(api_client)
             api.list_service_for_all_namespaces()
@@ -184,7 +195,10 @@ def test_legacy_authorization_key_still_authenticates(api_server):
     assert requests[0]["headers"]["Authorization"] == "Bearer legacy-token"
 
 
-def test_self_logs_deserializes_pods_and_reads_plain_text(api_server, monkeypatch):
+@pytest.mark.parametrize("log_text", ["ready caf\u00e9\n", '{"status":"ready"}\n'])
+def test_self_logs_deserializes_pods_and_reads_plain_text(
+    api_server, monkeypatch, log_text
+):
     host, routes, requests = api_server
     pod = {
         "metadata": {
@@ -210,7 +224,7 @@ def test_self_logs_deserializes_pods_and_reads_plain_text(api_server, monkeypatc
     routes["GET", "/api/v1/namespaces/default/pods"] = (
         200, {"apiVersion": "v1", "kind": "PodList", "items": [pod]}
     )
-    routes["GET", "/api/v1/namespaces/default/pods/holmes-0/log"] = (200, "ready\n")
+    routes["GET", "/api/v1/namespaces/default/pods/holmes-0/log"] = (200, log_text)
     monkeypatch.setattr(self_logs, "_detect_runner_namespace", lambda: "default")
     monkeypatch.setattr(self_logs, "detect_pod_name", lambda: "holmes-0")
     with client.ApiClient(_kube_configuration(host, {"token": "test-token"})) as api_client:
@@ -224,7 +238,7 @@ def test_self_logs_deserializes_pods_and_reads_plain_text(api_server, monkeypatc
     assert result["pods"][0]["ready"] is True
     assert result["pods"][0]["restarts"] == 2
     assert result["pods"][0]["containers"][0]["state"] == "running"
-    assert result["logs"][0]["text"] == "ready\n"
+    assert result["logs"][0]["text"] == log_text
     assert result["logs"][0]["error"] is None
     query = parse_qs(requests[-1]["url"].query)
     assert query["container"] == ["holmes"]

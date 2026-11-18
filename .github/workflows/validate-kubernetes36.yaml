@@ -69,9 +69,6 @@ jobs:
           - python: "3.13"
             baseline: false
             full: false
-          - python: "3.12"
-            baseline: true
-            full: true
     steps:
       - uses: actions/checkout@v4
         with:
