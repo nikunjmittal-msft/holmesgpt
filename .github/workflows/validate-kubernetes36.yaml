@@ -1,0 +1,123 @@
+name: Validate Kubernetes SDK 36
+
+on:
+  push:
+    branches:
+      - automation/validate-kubernetes36
+
+permissions:
+  contents: read
+
+env:
+  LITELLM_LOCAL_MODEL_COST_MAP: "True"
+  RUN_LIVE: "false"
+  SSL_VERIFY: "true"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "poetry==1.8.5" "cleo==2.1.0"
+      - run: |
+          poetry lock --no-update --no-interaction
+          poetry check --lock
+          git diff --check
+          python - <<'PY'
+          import json, pathlib, subprocess, tomllib
+          old = tomllib.loads(subprocess.check_output(["git", "show", "HEAD:poetry.lock"], text=True))
+          new = tomllib.loads(pathlib.Path("poetry.lock").read_text())
+          before = {(p["name"], p["version"]) for p in old["package"]}
+          after = {(p["name"], p["version"]) for p in new["package"]}
+          report = {"removed": sorted(before - after), "added": sorted(after - before)}
+          pathlib.Path("dependency-changes.json").write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+          assert [p["version"] for p in new["package"] if p["name"] == "kubernetes"] == ["36.0.3"]
+          assert new["metadata"]["lock-version"] == "2.0"
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes36-lock
+          path: |
+            poetry.lock
+            dependency-changes.json
+          retention-days: 7
+
+  test:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.10"
+            baseline: false
+            full: false
+          - python: "3.11"
+            baseline: false
+            full: false
+          - python: "3.12"
+            baseline: false
+            full: true
+          - python: "3.13"
+            baseline: false
+            full: false
+          - python: "3.12"
+            baseline: true
+            full: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Restore exact upstream baseline
+        if: matrix.baseline
+        run: git checkout 2154132de4fe50169d5adca10d7c9fd6d83ee734
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install "poetry==1.8.5" "cleo==2.1.0"
+      - uses: actions/download-artifact@v4
+        if: ${{ !matrix.baseline }}
+        with:
+          name: kubernetes36-lock
+      - run: |
+          poetry check --lock
+          poetry install --with dev --no-root --no-interaction
+          poetry run python -m pip check
+          poetry run python -c "import importlib.metadata as m; print('Kubernetes SDK:', m.version('kubernetes'))"
+      - uses: azure/setup-helm@v4
+        if: matrix.full
+        with:
+          version: v4.3.0
+      - name: Run focused real SDK and existing Kubernetes tests
+        if: ${{ !matrix.baseline }}
+        run: >-
+          poetry run pytest tests/test_kubernetes_sdk_compatibility.py
+          tests/core/test_self_logs.py tests/holmes_operator
+          tests/plugins/toolsets/kubernetes
+          tests/plugins/toolsets/test_kubernetes*.py
+          tests/integration/test_kubernetes_transformer_execution.py
+          -m "not llm" --no-cov -p no:sugar -q
+          --json-report --json-report-file=focused-results.json
+      - name: Run complete non-LLM suite
+        if: ${{ always() && matrix.full }}
+        run: >-
+          poetry run pytest tests -m "not llm" --no-cov -p no:sugar -q
+          --continue-on-collection-errors
+          --json-report --json-report-file=full-results.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kubernetes36-py${{ matrix.python }}-baseline-${{ matrix.baseline }}
+          path: |
+            focused-results.json
+            full-results.json
+          retention-days: 7
